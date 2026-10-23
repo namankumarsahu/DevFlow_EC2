@@ -1,0 +1,138 @@
+x-backend-env: &backend-env
+  NODE_ENV: production
+  DATABASE_URL: postgresql://devflow:${POSTGRES_PASSWORD}@postgres:5432/devflow
+  REDIS_URL: redis://redis:6379
+  JWT_SECRET: ${JWT_SECRET}
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+  DOMAIN: ${DOMAIN:-localhost}
+  ACME_EMAIL: ${ACME_EMAIL:-}
+  CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost}
+  HEALTH_PATH: ${HEALTH_PATH:-/}
+  HEALTH_TIMEOUT_MS: ${HEALTH_TIMEOUT_MS:-60000}
+  DRAIN_MS: ${DRAIN_MS:-10000}
+  # Step 6: build sandbox
+  BUILD_SANDBOX: ${BUILD_SANDBOX:-buildkit}
+  BUILDKIT_ADDR: tcp://buildkit:1234
+  MAX_REPO_MB: ${MAX_REPO_MB:-500}
+  # Step 7: per-app resource limits (defaults, and the most a non-admin may ask for)
+  DEFAULT_MEMORY_MB: ${DEFAULT_MEMORY_MB:-512}
+  DEFAULT_CPUS: ${DEFAULT_CPUS:-0.5}
+  DEFAULT_DISK_MB: ${DEFAULT_DISK_MB:-1024}
+  MAX_MEMORY_MB: ${MAX_MEMORY_MB:-2048}
+  MAX_CPUS: ${MAX_CPUS:-2}
+  MAX_DISK_MB: ${MAX_DISK_MB:-5120}
+  APP_PIDS_LIMIT: ${APP_PIDS_LIMIT:-256}
+  APP_NOFILE: ${APP_NOFILE:-4096}
+  APP_TMP_MB: ${APP_TMP_MB:-64}
+  APP_LOG_MAX_SIZE: ${APP_LOG_MAX_SIZE:-10m}
+  APP_LOG_MAX_FILES: ${APP_LOG_MAX_FILES:-3}
+  STORAGE_QUOTA: ${STORAGE_QUOTA:-false}
+  # Step 14: preview deployments
+  PREVIEW_MAX_PER_PROJECT: ${PREVIEW_MAX_PER_PROJECT:-5}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: devflow
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: devflow
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U devflow"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+
+  api:
+    build: ./backend
+    command: sh -c "npx prisma db push --skip-generate && node dist/server.js"
+    environment: *backend-env
+    volumes:
+      - caddy_admin:/run/caddy-admin # unix socket to push routes to Caddy
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./backend
+      args:
+        BUILDKIT_VERSION: ${BUILDKIT_VERSION:-v0.17.3}
+    command: node dist/worker.js
+    environment: *backend-env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock # worker builds & runs user apps via the host daemon
+      - caddy_admin:/run/caddy-admin
+    # Also on the apps network so it can health-check a new container before traffic moves to it,
+    # and on the builds network so it can talk to the BuildKit sandbox.
+    networks: [default, apps, builds]
+    depends_on:
+      - api
+      - buildkit
+    restart: unless-stopped
+
+  # Build sandbox: untrusted Dockerfiles run here, NOT on the host Docker daemon.
+  #  - rootless: "root" inside a build maps to an unprivileged user on the host
+  #  - own network: builds cannot reach postgres / redis / api / user apps
+  #  - capped CPU, memory and processes, and a capped build cache
+  # seccomp/apparmor must be "unconfined" for rootless BuildKit to create its user namespaces; the
+  # container is not --privileged and has no Docker socket. If the build step fails with a
+  # permission error on Ubuntu 24.04, see docs/SANDBOX.md.
+  buildkit:
+    image: moby/buildkit:${BUILDKIT_VERSION:-v0.17.3}-rootless
+    command: ["--addr", "tcp://0.0.0.0:1234", "--oci-worker-gc-keepstorage", "${BUILDKIT_CACHE_MB:-3000}"]
+    environment:
+      BUILDKITD_FLAGS: --oci-worker-no-process-sandbox
+    security_opt: [seccomp=unconfined, apparmor=unconfined]
+    networks: [builds]
+    volumes:
+      - buildkit_cache:/home/user/.local/share/buildkit
+    mem_limit: ${BUILDKIT_MEM:-1g}
+    cpus: ${BUILDKIT_CPUS:-1.0}
+    pids_limit: 1024
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend # internal only; Caddy is the public entrypoint
+    depends_on: [api]
+    restart: unless-stopped
+
+  # Front door: terminates HTTPS (auto Let's Encrypt) and routes by hostname.
+  #   <DOMAIN>         -> dashboard (frontend)
+  #   <slug>.<DOMAIN>  -> that project's container (routes pushed by api/worker)
+  caddy:
+    image: caddy:2-alpine
+    command: caddy run --config /etc/caddy/bootstrap.json --resume
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./caddy/bootstrap.json:/etc/caddy/bootstrap.json:ro
+      - caddy_data:/data # certificates: keep this volume or you will hit Let's Encrypt rate limits
+      - caddy_config:/config
+      - caddy_admin:/run/caddy-admin
+    networks: [default, apps]
+    restart: unless-stopped
+
+networks:
+  # Only the worker and BuildKit live here. Build steps can reach the internet (npm install, ...) but nothing of ours.
+  builds:
+    name: devflow_builds
+  # User app containers live here (plus Caddy). They cannot reach postgres/redis/api.
+  apps:
+    name: devflow_apps
+
+volumes:
+  pgdata:
+  redisdata:
+  caddy_data:
+  caddy_config:
+  caddy_admin:
+  buildkit_cache:

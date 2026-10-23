@@ -1,0 +1,139 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum Environment {
+  DEVELOPMENT
+  STAGING
+  PRODUCTION
+}
+
+enum PreviewStatus {
+  ACTIVE
+  CLOSED
+}
+
+enum DeploymentStatus {
+  QUEUED
+  BUILDING
+  DEPLOYING
+  SUCCESS
+  FAILED
+  CANCELLED
+}
+
+model User {
+  id           String       @id @default(uuid())
+  email        String       @unique
+  passwordHash String
+  role         Role         @default(USER)
+  createdAt    DateTime     @default(now())
+  projects     Project[]
+  deployments  Deployment[]
+}
+
+model Project {
+  id                  String       @id @default(uuid())
+  name                String
+  repoUrl             String
+  branch              String       @default("main")
+  environment         Environment  @default(PRODUCTION)
+  containerPort       Int          @default(3000)
+  memoryMb            Int          @default(512) // Step 7: per-app limits, applied on the next deploy
+  cpus                Float        @default(0.5)
+  diskMb              Int          @default(1024) // enforced only when STORAGE_QUOTA=true
+  hostPort            Int          @unique
+  slug                String?      @unique // subdomain: <slug>.<DOMAIN>
+  webhookSecret       String
+  currentDeploymentId String?
+  previewsEnabled     Boolean      @default(false) // Step 14: deploy every pull request to its own URL
+  githubTokenEnc      String? // Step 14: encrypted token used only to comment on pull requests
+  ownerId             String
+  owner               User         @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  envVars             EnvVar[]
+  deployments         Deployment[]
+  previews            Preview[]
+  createdAt           DateTime     @default(now())
+
+  @@index([ownerId])
+}
+
+// Step 14: one row per pull request. Lives at <slug>.<DOMAIN> while the PR is open.
+model Preview {
+  id                  String           @id @default(uuid())
+  projectId           String
+  project             Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  prNumber            Int
+  title               String           @default("")
+  branch              String // the PR's head branch (same-repo PRs only)
+  headSha             String?
+  slug                String           @unique // <project-slug>-pr<number>
+  status              PreviewStatus    @default(ACTIVE)
+  currentDeploymentId String?
+  commentId           String? // GitHub comment we keep editing instead of posting a new one
+  deployments         Deployment[]
+  createdAt           DateTime         @default(now())
+  updatedAt           DateTime         @updatedAt
+
+  @@unique([projectId, prNumber])
+  @@index([projectId, status])
+}
+
+model EnvVar {
+  id        String   @id @default(uuid())
+  key       String
+  valueEnc  String
+  projectId String
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  updatedAt DateTime @updatedAt
+
+  @@unique([projectId, key])
+}
+
+model Deployment {
+  id            String           @id @default(uuid())
+  projectId     String
+  project       Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  triggeredById String?
+  triggeredBy   User?            @relation(fields: [triggeredById], references: [id], onDelete: SetNull)
+  status        DeploymentStatus @default(QUEUED)
+  commitHash    String?
+  imageTag      String?
+  containerName String? // the docker container that serves this deployment (blue/green)
+  url           String?
+  error         String?
+  previewId     String? // set when this deployment belongs to a pull-request preview
+  preview       Preview?         @relation(fields: [previewId], references: [id], onDelete: Cascade)
+  rollbackOfId  String?
+  rollbackOf    Deployment?      @relation("Rollback", fields: [rollbackOfId], references: [id], onDelete: SetNull)
+  rollbacks     Deployment[]     @relation("Rollback")
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  durationMs    Int?
+  createdAt     DateTime         @default(now())
+  logs          DeploymentLog[]
+
+  @@index([projectId, createdAt])
+  @@index([previewId])
+  @@index([status])
+}
+
+model DeploymentLog {
+  id           Int        @id @default(autoincrement())
+  deploymentId String
+  deployment   Deployment @relation(fields: [deploymentId], references: [id], onDelete: Cascade)
+  line         String
+  createdAt    DateTime   @default(now())
+
+  @@index([deploymentId, id])
+}
