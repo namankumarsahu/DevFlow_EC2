@@ -4,6 +4,9 @@ Connect a GitHub repo, deploy with one click, watch the build live over WebSocke
 
 **Stack:** Node.js · Express 5 · TypeScript · PostgreSQL · Prisma · Redis · BullMQ · React · Tailwind · Docker Compose · GitHub Actions · Jest + Supertest
 
+
+## DevFlow Link: https://3.105.144.208.sslip.io
+
 ## Features
 - JWT auth with `USER` / `ADMIN` roles (first registered account is admin)
 - Projects: GitHub repo + branch + environment (dev/staging/prod)
